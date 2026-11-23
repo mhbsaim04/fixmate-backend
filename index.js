@@ -778,6 +778,15 @@ app.patch(
       { _id: id, technicianEmail: req.user.email, status: booking.status },
       update
     );
+    if (!result.matchedCount) {
+      return res
+        .status(409)
+        .json({ message: "This job was just updated. Refresh and try again." });
+    }
+
+    return res.json(serializeBooking(await bookings.findOne({ _id: id })));
+  })
+);
 
 // Payments
 app.post(
@@ -873,6 +882,151 @@ app.get(
     return res.json(records.map(serializeDoc));
   })
 );
+
+/* ----Profile --- */
+app.patch(
+  "/api/users/profile",
+  verifyToken,
+  route(async (req, res) => {
+    const body = req.body ?? {};
+    const updates = {};
+
+    if (body.name !== undefined) {
+      if (!isNonEmptyString(body.name, 2)) {
+        return res.status(400).json({ message: "Name is required." });
+      }
+      updates.name = body.name.trim();
+    }
+    for (const field of ["phone", "area"]) {
+      if (body[field] !== undefined) {
+        if (typeof body[field] !== "string" || body[field].length > 120) {
+          return res.status(400).json({ message: `Invalid ${field}.` });
+        }
+        updates[field] = body[field].trim();
+      }
+    }
+    if (body.bio !== undefined) {
+      if (typeof body.bio !== "string" || body.bio.length > 400) {
+        return res.status(400).json({ message: "Keep your bio under 400 characters." });
+      }
+      updates.bio = body.bio.trim();
+    }
+    if (body.image !== undefined) {
+      if (typeof body.image !== "string" || !/^https?:\/\//i.test(body.image)) {
+        return res.status(400).json({ message: "Invalid image URL." });
+      }
+      updates.image = body.image.trim();
+    }
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ message: "Nothing to update." });
+    }
+
+    // role and email are never writable here.
+    updates.updatedAt = new Date();
+    await users.updateOne({ _id: new ObjectId(req.user.id) }, { $set: updates });
+    const account = await users.findOne({ _id: new ObjectId(req.user.id) });
+    return res.json(serializeUser(account));
+  })
+);
+
+
+// Admin related API
+app.get(
+  "/api/admin/users",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const records = await users.find({}).sort({ createdAt: -1 }).toArray();
+    return res.json(records.map(serializeUser));
+  })
+);
+
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid user ID is required." });
+    if (!ROLES.includes(req.body?.role)) {
+      return res.status(400).json({ message: "Role must be customer, technician or admin." });
+    }
+    if (id.toString() === req.user.id) {
+      return res.status(403).json({ message: "You cannot change your own role." });
+    }
+
+    const result = await users.updateOne(
+      { _id: id },
+      { $set: { role: req.body.role, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(404).json({ message: "User not found." });
+    return res.json(serializeUser(await users.findOne({ _id: id })));
+  })
+);
+
+app.get(
+  "/api/admin/services",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const filter = {};
+    if (["pending", "approved", "rejected"].includes(req.query.approvalStatus)) {
+      filter.approvalStatus = req.query.approvalStatus;
+    }
+    const records = await services.find(filter).sort({ createdAt: -1 }).toArray();
+    return res.json(records.map(serializeDoc));
+  })
+);
+
+app.patch(
+  "/api/admin/services/:id/approval",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid service ID is required." });
+    const { approvalStatus } = req.body ?? {};
+    if (approvalStatus !== "approved" && approvalStatus !== "rejected") {
+      return res.status(400).json({ message: "Status must be approved or rejected." });
+    }
+
+    const result = await services.updateOne(
+      { _id: id },
+      { $set: { approvalStatus, reviewedAt: new Date() } }
+    );
+    if (!result.matchedCount) return res.status(404).json({ message: "Service not found." });
+    return res.json({ updated: true, approvalStatus });
+  })
+);
+
+app.get(
+  "/api/admin/bookings",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const filter = {};
+    if (
+      ["requested", "accepted", "rejected", "in-progress", "completed", "cancelled"].includes(
+        req.query.status
+      )
+    ) {
+      filter.status = req.query.status;
+    }
+    const records = await bookings.find(filter).sort({ createdAt: -1 }).toArray();
+    return res.json(records.map(serializeBooking));
+  })
+);
+
+app.get(
+  "/api/admin/payments",
+  verifyToken,
+  verifyAdmin,
+  route(async (req, res) => {
+    const records = await payments.find({}).sort({ paidAt: -1 }).toArray();
+    return res.json(records.map(serializeDoc));
+  })
+);
+
 
 //Fallbacks 
 app.use((req, res) => {
