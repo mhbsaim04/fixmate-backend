@@ -105,6 +105,25 @@ const connectedClient = await connectToMongoDB();
 const database = connectedClient.db(process.env.MONGODB_DB_NAME || "fixmate");
 // BetterAuth's MongoDB adapter 
 
+const users = database.collection("user");
+const services = database.collection("services");
+const bookings = database.collection("bookings");
+const payments = database.collection("payments");
+
+await services.createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 });
+await services.createIndex({ technicianEmail: 1, createdAt: -1 });
+await bookings.createIndex({ customerEmail: 1, createdAt: -1 });
+await bookings.createIndex({ technicianEmail: 1, createdAt: -1 });
+await bookings.createIndex({ serviceId: 1 });
+// One active request per customer + service, enforced by the database itself (race-safe).
+await bookings.createIndex(
+  { activeKey: 1 },
+  { unique: true, partialFilterExpression: { activeKey: { $type: "string" } } }
+);
+await payments.createIndex({ customerEmail: 1, paidAt: -1 });
+// The same payment can never be saved twice, and a booking is paid at most once.
+await payments.createIndex({ stripeSessionId: 1 }, { unique: true });
+await payments.createIndex({ bookingId: 1 }, { unique: true });
 
 // Wraps async routes
 
