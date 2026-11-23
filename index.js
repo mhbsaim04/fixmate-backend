@@ -531,6 +531,349 @@ app.delete(
   })
 );
 
+// Customer booking related API
+
+app.post(
+  "/api/bookings",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    const body = req.body ?? {};
+    const serviceId = toObjectId(body.serviceId);
+    if (!serviceId) return res.status(400).json({ message: "A valid service is required." });
+
+    const phone = String(body.customerPhone ?? "").trim();
+    const address = String(body.address ?? "").trim();
+    const problem = String(body.problemDescription ?? "").trim();
+    const dateText = String(body.preferredDate ?? "");
+
+    if (!/^[+\d][\d\s-]{5,}$/.test(phone)) {
+      return res.status(400).json({ message: "Enter a valid phone number." });
+    }
+    if (address.length < 8) {
+      return res.status(400).json({ message: "Enter the full service address." });
+    }
+    if (problem.length < 20) {
+      return res
+        .status(400)
+        .json({ message: "Describe the problem in at least 20 characters." });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+      return res.status(400).json({ message: "Pick a valid preferred date." });
+    }
+    const preferredDate = new Date(`${dateText}T00:00:00.000Z`);
+    // One day of tolerance so customers west of UTC can still pick "today".
+    const earliest = Date.now() - 36 * 60 * 60 * 1000;
+    if (Number.isNaN(preferredDate.getTime()) || preferredDate.getTime() < earliest) {
+      return res.status(400).json({ message: "Preferred date must be today or later." });
+    }
+
+    const service = await services.findOne({ _id: serviceId });
+    if (!service || service.approvalStatus !== "approved" || !service.isAvailable) {
+      return res.status(404).json({ message: "This service is no longer available." });
+    }
+    if (service.technicianEmail === req.user.email) {
+      return res
+        .status(403)
+        .json({ message: "You cannot request your own service." });
+    }
+
+    const now = new Date();
+    const serviceKey = serviceId.toString();
+    const booking = {
+      serviceId: serviceKey,
+      serviceTitle: service.title,
+      serviceImage: service.image,
+      category: service.category,
+      basePrice: service.basePrice,
+      technicianName: service.technicianName,
+      technicianEmail: service.technicianEmail,
+      customerName: req.user.name,
+      customerEmail: req.user.email,
+      customerPhone: phone,
+      address,
+      preferredDate,
+      problemDescription: problem,
+      status: "requested",
+      finalAmount: service.basePrice,
+      paymentStatus: "unpaid",
+      statusHistory: [{ status: "requested", changedAt: now }],
+      createdAt: now,
+      // Unique while the job is active; removed when it ends. Blocks duplicates even under a race.
+      activeKey: `${req.user.email}|${serviceKey}`,
+    };
+
+    try {
+      const result = await bookings.insertOne(booking);
+      return res
+        .status(201)
+        .json(serializeBooking({ ...booking, _id: result.insertedId }));
+    } catch (err) {
+      if (err?.code === 11000) {
+        return res.status(409).json({
+          message: "You already have an active request for this service",
+        });
+      }
+      throw err;
+    }
+  })
+);
+
+app.get(
+  "/api/bookings/my",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    const records = await bookings
+      .find({ customerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(records.map(serializeBooking));
+  })
+);
+
+app.patch(
+  "/api/bookings/:id/cancel",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid booking ID is required." });
+
+    const now = new Date();
+    const result = await bookings.updateOne(
+      { _id: id, customerEmail: req.user.email, status: "requested" },
+      {
+        $set: { status: "cancelled", updatedAt: now },
+        $push: { statusHistory: { status: "cancelled", changedAt: now } },
+        $unset: { activeKey: "" },
+      }
+    );
+    if (result.matchedCount) return res.json({ updated: true, status: "cancelled" });
+
+    const booking = await bookings.findOne({ _id: id });
+    if (!booking) return res.status(404).json({ message: "Booking not found." });
+    if (booking.customerEmail !== req.user.email) {
+      return res.status(403).json({ message: "Forbidden: this is not your booking." });
+    }
+    return res.status(409).json({
+      message: "Only a request that is still waiting for the technician can be cancelled.",
+    });
+  })
+);
+
+app.post(
+  "/api/bookings/:id/review",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid booking ID is required." });
+
+    const rating = Number(req.body?.rating);
+    const review = typeof req.body?.review === "string" ? req.body.review.trim() : "";
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ message: "Rating must be a whole number from 1 to 5." });
+    }
+    if (review.length > 300) {
+      return res.status(400).json({ message: "Keep your review under 300 characters." });
+    }
+
+    const result = await bookings.updateOne(
+      {
+        _id: id,
+        customerEmail: req.user.email,
+        paymentStatus: "paid",
+        rating: { $exists: false },
+      },
+      { $set: { rating, review, reviewedAt: new Date() } }
+    );
+    if (result.matchedCount) return res.json({ updated: true, rating, review });
+
+    const booking = await bookings.findOne({ _id: id });
+    if (!booking) return res.status(404).json({ message: "Booking not found." });
+    if (booking.customerEmail !== req.user.email) {
+      return res.status(403).json({ message: "Forbidden: this is not your booking." });
+    }
+    return res.status(409).json({
+      message:
+        booking.rating !== undefined
+          ? "You have already reviewed this job."
+          : "You can review a job after it has been paid.",
+    });
+  })
+);
+
+
+//Technician booking related API
+app.get(
+  "/api/bookings/technician",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const records = await bookings
+      .find({ technicianEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(records.map(serializeBooking));
+  })
+);
+
+// The job pipeline. Anything not listed here is rejected.
+const STATUS_TRANSITIONS = {
+  requested: ["accepted", "rejected"],
+  accepted: ["in-progress"],
+  "in-progress": ["completed"],
+};
+
+app.patch(
+  "/api/bookings/:id/status",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid booking ID is required." });
+
+    const nextStatus = req.body?.status;
+    if (typeof nextStatus !== "string") {
+      return res.status(400).json({ message: "A new status is required." });
+    }
+
+    const booking = await bookings.findOne({ _id: id });
+    if (!booking) return res.status(404).json({ message: "Booking not found." });
+    if (booking.technicianEmail !== req.user.email) {
+      return res.status(403).json({ message: "Forbidden: this is not your job." });
+    }
+
+    const allowed = STATUS_TRANSITIONS[booking.status] ?? [];
+    if (!allowed.includes(nextStatus)) {
+      return res.status(409).json({
+        message: `A ${booking.status} job cannot be changed to ${nextStatus}.`,
+      });
+    }
+
+    const now = new Date();
+    const updates = { status: nextStatus, updatedAt: now };
+    if (nextStatus === "completed") {
+      const finalAmount = Number(req.body?.finalAmount);
+      if (!Number.isFinite(finalAmount) || finalAmount <= 0 || finalAmount > 1000000) {
+        return res
+          .status(400)
+          .json({ message: "Send a final amount greater than 0 to complete the job." });
+      }
+      updates.finalAmount = Math.round(finalAmount * 100) / 100;
+    }
+
+    const update = {
+      $set: updates,
+      $push: { statusHistory: { status: nextStatus, changedAt: now } },
+    };
+    // Only requested / accepted / in-progress count as "active" for duplicate checks.
+    if (nextStatus === "rejected" || nextStatus === "completed") {
+      update.$unset = { activeKey: "" };
+    }
+
+    // The status in the filter makes this safe if two requests arrive at once.
+    const result = await bookings.updateOne(
+      { _id: id, technicianEmail: req.user.email, status: booking.status },
+      update
+    );
+
+// Payments
+app.post(
+  "/api/payments/create-checkout-session",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    if (!stripe) return res.status(503).json({ message: "Payments are not configured." });
+
+    const bookingId = toObjectId(req.body?.bookingId);
+    if (!bookingId) return res.status(400).json({ message: "A valid booking is required." });
+
+    const booking = await bookings.findOne({ _id: bookingId });
+    if (!booking) return res.status(404).json({ message: "Booking not found." });
+    if (booking.customerEmail !== req.user.email) {
+      return res.status(403).json({ message: "Forbidden: this is not your booking." });
+    }
+    if (booking.status !== "completed" || booking.paymentStatus !== "unpaid") {
+      return res
+        .status(409)
+        .json({ message: "Only a completed, unpaid job can be paid." });
+    }
+
+    // The price comes from the database. The client never sends an amount.
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: req.user.email,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency: "usd",
+            unit_amount: Math.round(booking.finalAmount * 100),
+            product_data: {
+              name: booking.serviceTitle,
+              description: `Repair by ${booking.technicianName}`,
+            },
+          },
+        },
+      ],
+      metadata: {
+        bookingId: booking._id.toString(),
+        customerEmail: req.user.email,
+      },
+      success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${clientUrl}/payment/cancel`,
+    });
+
+    return res.json({ url: session.url });
+  })
+);
+
+app.get(
+  "/api/payments/verify",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    if (!stripe) return res.status(503).json({ message: "Payments are not configured." });
+
+    const sessionId = req.query.session_id;
+    if (typeof sessionId !== "string" || !/^cs_(test|live)_[A-Za-z0-9]+$/.test(sessionId)) {
+      return res.status(400).json({ message: "A valid Stripe session is required." });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ["payment_intent"],
+    });
+    if (session.metadata?.customerEmail !== req.user.email) {
+      return res
+        .status(403)
+        .json({ message: "Forbidden: this payment belongs to another account." });
+    }
+
+    try {
+      const payment = await fulfillCheckoutSession(session);
+      return res.json({ payment: serializeDoc(payment) });
+    } catch (err) {
+      if (err.status) return res.status(err.status).json({ message: err.message });
+      throw err;
+    }
+  })
+);
+
+app.get(
+  "/api/payments/my",
+  verifyToken,
+  verifyCustomer,
+  route(async (req, res) => {
+    const records = await payments
+      .find({ customerEmail: req.user.email })
+      .sort({ paidAt: -1 })
+      .toArray();
+    return res.json(records.map(serializeDoc));
+  })
+);
+
 //Fallbacks 
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found." });
