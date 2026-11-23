@@ -106,6 +106,119 @@ const database = connectedClient.db(process.env.MONGODB_DB_NAME || "fixmate");
 // BetterAuth's MongoDB adapter 
 
 
+// Wraps async routes
+
+const route = (handler) => (req, res, next) =>
+  Promise.resolve(handler(req, res, next)).catch((err) => {
+    console.error(`${req.method} ${req.originalUrl} failed:`, err);
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Something went wrong. Please try again." });
+    }
+  });
+
+function toObjectId(value) {
+  return typeof value === "string" && ObjectId.isValid(value)
+    ? new ObjectId(value)
+    : null;
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const isNonEmptyString = (v, min = 1) =>
+  typeof v === "string" && v.trim().length >= min;
+
+function serializeUser(user) {
+  return {
+    _id: user._id.toString(),
+    name: user.name ?? "",
+    email: user.email ?? "",
+    image: user.image ?? null,
+    role: ROLES.includes(user.role) ? user.role : "customer",
+    phone: user.phone ?? "",
+    area: user.area ?? "",
+    bio: user.bio ?? "",
+    createdAt: user.createdAt ?? null,
+  };
+}
+
+function serializeBooking(booking) {
+  const { _id, activeKey, ...fields } = booking;
+  return { ...fields, _id: _id.toString() };
+}
+
+function serializeDoc(doc) {
+  return { ...doc, _id: doc._id.toString() };
+}
+
+async function getRatingMap(serviceIds) {
+  if (!serviceIds.length) return new Map();
+  const rows = await bookings
+    .aggregate([
+      { $match: { serviceId: { $in: serviceIds }, rating: { $gte: 1 } } },
+      {
+        $group: {
+          _id: "$serviceId",
+          avg: { $avg: "$rating" },
+          count: { $sum: 1 },
+        },
+      },
+    ])
+    .toArray();
+  return new Map(rows.map((r) => [r._id, r]));
+}
+
+function withRating(service, ratingMap) {
+  const id = service._id.toString();
+  const rating = ratingMap.get(id);
+  return {
+    ...service,
+    _id: id,
+    avgRating: rating ? Math.round(rating.avg * 10) / 10 : 0,
+    reviewCount: rating?.count ?? 0,
+  };
+}
+
+function validateServiceBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "Service details are required." };
+  }
+  const basePrice = Number(body.basePrice);
+  if (!isNonEmptyString(body.title, 3)) return { error: "Title is required." };
+  if (!CATEGORIES.includes(body.category)) return { error: "Choose a valid category." };
+  if (!isNonEmptyString(body.description, 20)) {
+    return { error: "Description must be at least 20 characters." };
+  }
+  if (!isNonEmptyString(body.image) || !/^https?:\/\//i.test(body.image)) {
+    return { error: "A service image is required." };
+  }
+  if (!Number.isFinite(basePrice) || basePrice <= 0 || basePrice > 100000) {
+    return { error: "Base price must be a positive number." };
+  }
+  if (!isNonEmptyString(body.estimatedDuration, 2)) {
+    return { error: "Estimated duration is required." };
+  }
+  if (!SERVICE_MODES.includes(body.serviceMode)) {
+    return { error: "Choose a valid service mode." };
+  }
+  if (!isNonEmptyString(body.serviceArea, 2)) return { error: "Service area is required." };
+
+  return {
+    value: {
+      title: body.title.trim(),
+      category: body.category,
+      description: body.description.trim(),
+      image: body.image.trim(),
+      basePrice: Math.round(basePrice * 100) / 100,
+      estimatedDuration: body.estimatedDuration.trim(),
+      serviceMode: body.serviceMode,
+      serviceArea: body.serviceArea.trim(),
+    },
+  };
+}
+
+
 // Auth middlewares
 
 async function verifyToken(req, res, next) {
@@ -150,6 +263,141 @@ const requireRole = (role, label) => (req, res, next) => {
 const verifyCustomer = requireRole("customer", "customer");
 const verifyTechnician = requireRole("technician", "technician");
 const verifyAdmin = requireRole("admin", "admin");
+
+
+async function fulfillCheckoutSession(session) {
+  if (session.payment_status !== "paid") {
+    const error = new Error("Stripe has not confirmed this payment yet.");
+    error.status = 409;
+    throw error;
+  }
+
+  const bookingId = toObjectId(session.metadata?.bookingId);
+  if (!bookingId) {
+    const error = new Error("This checkout session is not a FixMate booking.");
+    error.status = 400;
+    throw error;
+  }
+
+  const booking = await bookings.findOne({ _id: bookingId });
+  if (!booking) {
+    const error = new Error("The booking for this payment was not found.");
+    error.status = 404;
+    throw error;
+  }
+
+  // Never trust the session blindly: it must match what the database says this job costs.
+  if (
+    session.metadata?.customerEmail !== booking.customerEmail ||
+    booking.status !== "completed" ||
+    session.currency !== "usd" ||
+    session.amount_total !== Math.round(booking.finalAmount * 100)
+  ) {
+    const error = new Error("This payment does not match the booking.");
+    error.status = 400;
+    throw error;
+  }
+
+  const paymentIntentId =
+    typeof session.payment_intent === "string"
+      ? session.payment_intent
+      : session.payment_intent?.id;
+
+  const paymentDoc = {
+    bookingId: booking._id.toString(),
+    serviceTitle: booking.serviceTitle,
+    customerName: booking.customerName,
+    customerEmail: booking.customerEmail,
+    technicianName: booking.technicianName,
+    technicianEmail: booking.technicianEmail,
+    amount: booking.finalAmount,
+    currency: "usd",
+    transactionId: paymentIntentId ?? session.id,
+    stripeSessionId: session.id,
+    paymentStatus: "paid",
+    paidAt: new Date(),
+  };
+
+  // $setOnInsert + unique indexes = the same payment is never saved twice,
+  // even if the success page and the webhook (or Stripe's retries) run at the same time.
+  try {
+    await payments.updateOne(
+      { stripeSessionId: session.id },
+      { $setOnInsert: paymentDoc },
+      { upsert: true }
+    );
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+  }
+
+  const now = new Date();
+  await bookings.updateOne(
+    { _id: booking._id, paymentStatus: "unpaid" },
+    {
+      $set: { paymentStatus: "paid", paidAt: now, updatedAt: now },
+      $push: { statusHistory: { status: "paid", changedAt: now } },
+    }
+  );
+
+  return (
+    (await payments.findOne({ stripeSessionId: session.id })) ??
+    (await payments.findOne({ bookingId: booking._id.toString() }))
+  );
+}
+
+
+// Route
+
+app.get("/", (req, res) => {
+  res.send("The FixMate backend is up and running!");
+});
+
+/* ---------- Services: public ---------- */
+// Search, filter, sort and pagination all happen in MongoDB (Challenge 1).
+app.get(
+  "/api/services",
+  route(async (req, res) => {
+    const { search, category, mode, sort } = req.query;
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 12));
+
+    const filter = { approvalStatus: "approved", isAvailable: true };
+    if (typeof search === "string" && search.trim()) {
+      const regex = new RegExp(escapeRegex(search.trim()), "i");
+      filter.$or = [{ title: regex }, { category: regex }];
+    }
+    if (typeof category === "string" && category && category !== "All") {
+      filter.category = category;
+    }
+    if (typeof mode === "string" && mode && mode !== "All") {
+      filter.serviceMode = mode;
+    }
+
+    const sortMap = {
+      "price-asc": { basePrice: 1, _id: 1 },
+      "price-desc": { basePrice: -1, _id: 1 },
+      newest: { createdAt: -1, _id: -1 },
+    };
+
+    const [records, total] = await Promise.all([
+      services
+        .find(filter)
+        .sort(sortMap[sort] ?? sortMap.newest)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+      services.countDocuments(filter),
+    ]);
+
+    const ratingMap = await getRatingMap(records.map((s) => s._id.toString()));
+    return res.json({
+      services: records.map((s) => withRating(s, ratingMap)),
+      total,
+      page,
+      totalPages: Math.max(1, Math.ceil(total / limit)),
+    });
+  })
+);
 
 //Fallbacks 
 app.use((req, res) => {
