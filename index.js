@@ -103,9 +103,55 @@ export async function connectToMongoDB() {
 
 const connectedClient = await connectToMongoDB();
 const database = connectedClient.db(process.env.MONGODB_DB_NAME || "fixmate");
-// BetterAuth's MongoDB adapter stores accounts in the "user" collection.
+// BetterAuth's MongoDB adapter 
 
-/* ---------- Fallbacks ---------- */
+
+// Auth middlewares
+
+async function verifyToken(req, res, next) {
+  const header = req.headers.authorization ?? "";
+  if (!header.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized: sign in to continue." });
+  }
+
+  try {
+    const { payload } = await jwtVerify(header.slice(7), JWKS, {
+      issuer: [process.env.BETTER_AUTH_URL, betterAuthUrl, new URL(betterAuthUrl).origin],
+    });
+    const userId = toObjectId(String(payload.id ?? payload.sub ?? ""));
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized: invalid token." });
+    }
+
+    const account = await users.findOne({ _id: userId });
+    if (!account) {
+      return res.status(401).json({ message: "Unauthorized: account not found." });
+    }
+
+    req.user = {
+      id: account._id.toString(),
+      name: account.name ?? "",
+      email: account.email,
+      image: account.image ?? null,
+      role: ROLES.includes(account.role) ? account.role : "customer",
+    };
+    return next();
+  } catch (err) {
+    return res.status(401).json({ message: "Unauthorized: invalid or expired token." });
+  }
+}
+
+const requireRole = (role, label) => (req, res, next) => {
+  if (req.user?.role !== role) {
+    return res.status(403).json({ message: `Forbidden: ${label} access only.` });
+  }
+  return next();
+};
+const verifyCustomer = requireRole("customer", "customer");
+const verifyTechnician = requireRole("technician", "technician");
+const verifyAdmin = requireRole("admin", "admin");
+
+//Fallbacks 
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found." });
 });
