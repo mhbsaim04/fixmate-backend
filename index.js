@@ -33,7 +33,22 @@ const SERVICE_MODES = ["Home Visit", "Shop Drop-off"];
 const ROLES = ["customer", "technician", "admin"];
 const ACTIVE_STATUSES = ["requested", "accepted", "in-progress"];
 
+// Database
+const client = new MongoClient(process.env.MONGODB_URI);
+export async function connectToMongoDB() {
+  try {
+    await client.connect();
+    console.log("You successfully connected to MongoDB!");
+    return client;
+  } catch (err) {
+    console.error("Failed to connect to MongoDB:", err);
+    throw err;
+  }
+}
 
+const connectedClient = await connectToMongoDB();
+const database = connectedClient.db(process.env.MONGODB_DB_NAME || "fixmate");
+// BetterAuth's MongoDB adapter stores accounts in the "user" collection.
 
 /* ---------- Fallbacks ---------- */
 app.use((req, res) => {
