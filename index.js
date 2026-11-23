@@ -1072,6 +1072,34 @@ app.use((err, req, res, next) => {
   res.status(status).json({ message: status === 403 ? err.message : "Server error." });
 });
 
+async function seedAdmins() {
+  const authUrl = (process.env.BETTER_AUTH_URL || "").replace(/\/$/, "");
+  if (!authUrl) return;
+  const admins = [
+    { name: process.env.ADMIN_NAME, email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD },
+    { name: process.env.ADMIN_NAME2, email: process.env.ADMIN_EMAIL2, password: process.env.ADMIN_PASSWORD2 },
+  ].filter((a) => a.name && a.email && a.password);
+
+  for (const admin of admins) {
+    try {
+      const res = await fetch(`${authUrl}/api/auth/sign-up/email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: admin.name, email: admin.email, password: admin.password, role: "admin" }),
+      });
+      if (res.ok) console.log(`Seeded admin: ${admin.email}`);
+      else console.log(`Admin may already exist or signup failed for ${admin.email}: ${res.status}`);
+    } catch (err) {
+      console.error(`Could not seed admin ${admin.email}:`, err?.message || err);
+    }
+  }
+}
+
+// Seed admins shortly after startup (frontend may need a moment to boot).
+setTimeout(() => {
+  seedAdmins().catch((err) => console.error("Admin seeding failed:", err));
+}, 3000);
+
 app.listen(port, () => {
   console.log(`fixmate is running on port ${port}`);
 });
