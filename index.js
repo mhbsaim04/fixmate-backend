@@ -12,6 +12,17 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
+
+  const allowedOrigins = new Set(
+    (process.env.CLIENT_ORIGINS || "")
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean)
+  );
+const clientUrl = (
+  process.env.CLIENT_URL || allowedOrigins.values().next().value
+).replace(/\/$/, "");
+
 if (!process.env.MONGODB_URI) {
   throw new Error("MONGODB_URI must be configured");
 }
@@ -85,6 +96,8 @@ app.use(
       return callback(new Error("Origin is not allowed by CORS"));
     },
     credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   })
 );
 
