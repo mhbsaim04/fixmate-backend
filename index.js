@@ -352,8 +352,8 @@ app.get("/", (req, res) => {
   res.send("The FixMate backend is up and running!");
 });
 
-/* ---------- Services: public ---------- */
-// Search, filter, sort and pagination all happen in MongoDB (Challenge 1).
+//Services: public 
+
 app.get(
   "/api/services",
   route(async (req, res) => {
@@ -396,6 +396,138 @@ app.get(
       page,
       totalPages: Math.max(1, Math.ceil(total / limit)),
     });
+  })
+);
+
+
+// Techncian Services
+app.get(
+  "/api/services/mine",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const records = await services
+      .find({ technicianEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.json(records.map(serializeDoc));
+  })
+);
+
+app.get(
+  "/api/services/:id",
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(404).json({ message: "Service not found." });
+
+    const service = await services.findOne({ _id: id });
+    if (!service || service.approvalStatus !== "approved" || !service.isAvailable) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+
+    const technician = await users.findOne(
+      { email: service.technicianEmail },
+      { projection: { name: 1, image: 1, area: 1, bio: 1 } }
+    );
+    const ratingMap = await getRatingMap([service._id.toString()]);
+
+    return res.json({
+      ...withRating(service, ratingMap),
+      technician: {
+        name: technician?.name ?? service.technicianName,
+        image: technician?.image ?? null,
+        area: technician?.area ?? "",
+        bio: technician?.bio ?? "",
+      },
+    });
+  })
+);
+
+app.post(
+  "/api/services",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const { error, value } = validateServiceBody(req.body);
+    if (error) return res.status(400).json({ message: error });
+
+    const service = {
+      ...value,
+      technicianName: req.user.name,
+      technicianEmail: req.user.email,
+      approvalStatus: "pending",
+      isAvailable: true,
+      createdAt: new Date(),
+    };
+    const result = await services.insertOne(service);
+    return res.status(201).json({ ...service, _id: result.insertedId.toString() });
+  })
+);
+
+app.patch(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid service ID is required." });
+
+    const { error, value } = validateServiceBody(req.body);
+    if (error) return res.status(400).json({ message: error });
+
+    const existing = await services.findOne({ _id: id });
+    if (!existing) return res.status(404).json({ message: "Service not found." });
+    if (existing.technicianEmail !== req.user.email) {
+      return res.status(403).json({ message: "Forbidden: this is not your service." });
+    }
+
+    // Any edit sends the listing back to the admin.
+    await services.updateOne(
+      { _id: id, technicianEmail: req.user.email },
+      { $set: { ...value, approvalStatus: "pending", updatedAt: new Date() } }
+    );
+    return res.json(serializeDoc(await services.findOne({ _id: id })));
+  })
+);
+
+app.patch(
+  "/api/services/:id/availability",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid service ID is required." });
+    if (typeof req.body?.isAvailable !== "boolean") {
+      return res.status(400).json({ message: "isAvailable must be true or false." });
+    }
+
+    const result = await services.updateOne(
+      { _id: id, technicianEmail: req.user.email },
+      { $set: { isAvailable: req.body.isAvailable, updatedAt: new Date() } }
+    );
+    if (!result.matchedCount) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+    return res.json({ updated: true, isAvailable: req.body.isAvailable });
+  })
+);
+
+app.delete(
+  "/api/services/:id",
+  verifyToken,
+  verifyTechnician,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid service ID is required." });
+
+    const result = await services.deleteOne({
+      _id: id,
+      technicianEmail: req.user.email,
+    });
+    if (!result.deletedCount) {
+      return res.status(404).json({ message: "Service not found." });
+    }
+    return res.json({ deleted: true });
   })
 );
 
