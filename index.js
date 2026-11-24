@@ -1084,7 +1084,7 @@ async function seedAdmins() {
     try {
       const res = await fetch(`${authUrl}/api/auth/sign-up/email`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Origin: authUrl },
         body: JSON.stringify({ name: admin.name, email: admin.email, password: admin.password, role: "admin" }),
       });
       if (res.ok) console.log(`Seeded admin: ${admin.email}`);
