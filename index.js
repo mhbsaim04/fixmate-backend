@@ -1103,3 +1103,5 @@ setTimeout(() => {
 app.listen(port, () => {
   console.log(`fixmate is running on port ${port}`);
 });
+
+export default app
