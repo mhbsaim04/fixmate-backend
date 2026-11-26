@@ -48,44 +48,6 @@ const SERVICE_MODES = ["Home Visit", "Shop Drop-off"];
 const ROLES = ["customer", "technician", "admin"];
 const ACTIVE_STATUSES = ["requested", "accepted", "in-progress"];
 
-// Stripe webhook
-app.post(
-  "/api/payments/webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-      return res.status(503).json({ message: "Webhook is not configured." });
-    }
-
-    let event;
-    try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers["stripe-signature"],
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
-    } catch (err) {
-      console.error("Webhook signature verification failed:", err.message);
-      return res.status(400).json({ message: "Invalid webhook signature." });
-    }
-
-    try {
-      if (
-        event.type === "checkout.session.completed" ||
-        event.type === "checkout.session.async_payment_succeeded"
-      ) {
-        // Safe to call repeatedly: fulfillment is idempotent.
-        await fulfillCheckoutSession(event.data.object);
-      }
-      return res.json({ received: true });
-    } catch (err) {
-      console.error("Webhook fulfillment failed:", err);
-      // 500 makes Stripe retry later; retries never create duplicate payments.
-      return res.status(500).json({ message: "Webhook handling failed." });
-    }
-  }
-);
-
 app.use(express.json());
 app.use(
   cors({
