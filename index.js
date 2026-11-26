@@ -573,7 +573,32 @@ app.get(
       { email: service.technicianEmail },
       { projection: { name: 1, image: 1, area: 1, bio: 1 } }
     );
-    const ratingMap = await getRatingMap([service._id.toString()]);
+    const serviceKey = service._id.toString();
+    const ratingMap = await getRatingMap([serviceKey]);
+
+    const reviewBookings = await bookings
+      .find({ serviceId: serviceKey, rating: { $gte: 1 } })
+      .sort({ reviewedAt: -1, createdAt: -1 })
+      .limit(50)
+      .toArray();
+
+    const customerEmails = [...new Set(reviewBookings.map((b) => b.customerEmail).filter(Boolean))];
+    const customerUsers = customerEmails.length
+      ? await users.find({ email: { $in: customerEmails } }, { projection: { email: 1, image: 1 } }).toArray()
+      : [];
+    const customerImageMap = new Map(customerUsers.map((u) => [u.email, u.image]));
+
+    const reviews = reviewBookings.map((b) => ({
+      _id: b._id.toString(),
+      customerName: b.customerName || "Verified Customer",
+      customerEmail: b.customerEmail,
+      customerImage: customerImageMap.get(b.customerEmail) || null,
+      rating: b.rating,
+      review: b.review || "",
+      comment: b.review || "",
+      reviewedAt: b.reviewedAt || b.createdAt,
+      createdAt: b.createdAt,
+    }));
 
     return res.json({
       ...withRating(service, ratingMap),
@@ -583,7 +608,46 @@ app.get(
         area: technician?.area ?? "",
         bio: technician?.bio ?? "",
       },
+      reviews,
     });
+  })
+);
+
+app.get(
+  "/api/services/:id/reviews",
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(404).json({ message: "Service not found." });
+
+    const service = await services.findOne({ _id: id });
+    if (!service) return res.status(404).json({ message: "Service not found." });
+
+    const serviceKey = service._id.toString();
+    const reviewBookings = await bookings
+      .find({ serviceId: serviceKey, rating: { $gte: 1 } })
+      .sort({ reviewedAt: -1, createdAt: -1 })
+      .limit(50)
+      .toArray();
+
+    const customerEmails = [...new Set(reviewBookings.map((b) => b.customerEmail).filter(Boolean))];
+    const customerUsers = customerEmails.length
+      ? await users.find({ email: { $in: customerEmails } }, { projection: { email: 1, image: 1 } }).toArray()
+      : [];
+    const customerImageMap = new Map(customerUsers.map((u) => [u.email, u.image]));
+
+    const reviews = reviewBookings.map((b) => ({
+      _id: b._id.toString(),
+      customerName: b.customerName || "Verified Customer",
+      customerEmail: b.customerEmail,
+      customerImage: customerImageMap.get(b.customerEmail) || null,
+      rating: b.rating,
+      review: b.review || "",
+      comment: b.review || "",
+      reviewedAt: b.reviewedAt || b.createdAt,
+      createdAt: b.createdAt,
+    }));
+
+    return res.json(reviews);
   })
 );
 
