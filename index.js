@@ -122,6 +122,7 @@ const users = database.collection("user");
 const services = database.collection("services");
 const bookings = database.collection("bookings");
 const payments = database.collection("payments");
+const notifications = database.collection("notifications");
 
 await services.createIndex({ approvalStatus: 1, isAvailable: 1, createdAt: -1 });
 await services.createIndex({ technicianEmail: 1, createdAt: -1 });
@@ -137,6 +138,8 @@ await payments.createIndex({ customerEmail: 1, paidAt: -1 });
 // The same payment can never be saved twice, and a booking is paid at most once.
 await payments.createIndex({ stripeSessionId: 1 }, { unique: true });
 await payments.createIndex({ bookingId: 1 }, { unique: true });
+await notifications.createIndex({ recipientEmail: 1, createdAt: -1 });
+await notifications.createIndex({ eventKey: 1 }, { unique: true, sparse: true });
 
 // Wraps async routes
 
@@ -182,6 +185,34 @@ function serializeBooking(booking) {
 
 function serializeDoc(doc) {
   return { ...doc, _id: doc._id.toString() };
+}
+
+function serializeNotification(notification) {
+  const { _id, ...fields } = notification;
+  delete fields.recipientEmail;
+  delete fields.recipientRole;
+  delete fields.eventKey;
+  return { ...fields, _id: _id.toString() };
+}
+
+async function createNotification(notification) {
+  try {
+    await notifications.updateOne(
+      { eventKey: notification.eventKey },
+      {
+        $setOnInsert: {
+          ...notification,
+          readAt: null,
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+  } catch (err) {
+    if (err?.code !== 11000) {
+      console.error(`Could not save notification ${notification.eventKey}:`, err);
+    }
+  }
 }
 
 async function getRatingMap(serviceIds) {
@@ -371,6 +402,27 @@ async function fulfillCheckoutSession(session) {
     }
   );
 
+  await Promise.all([
+    createNotification({
+      eventKey: `booking:${booking._id}:paid:customer`,
+      recipientEmail: booking.customerEmail,
+      recipientRole: "customer",
+      type: "payment",
+      title: "Payment confirmed",
+      message: `Your payment for ${booking.serviceTitle} was successful.`,
+      href: "/dashboard/customer/payments",
+    }),
+    createNotification({
+      eventKey: `booking:${booking._id}:paid:technician`,
+      recipientEmail: booking.technicianEmail,
+      recipientRole: "technician",
+      type: "payment",
+      title: "Customer payment received",
+      message: `${booking.customerName} paid for ${booking.serviceTitle}.`,
+      href: "/dashboard/technician",
+    }),
+  ]);
+
   return (
     (await payments.findOne({ stripeSessionId: session.id })) ??
     (await payments.findOne({ bookingId: booking._id.toString() }))
@@ -383,6 +435,66 @@ async function fulfillCheckoutSession(session) {
 app.get("/", (req, res) => {
   res.send("The FixMate backend is up and running!");
 });
+
+const verifyNotificationRole = (req, res, next) => {
+  if (!["customer", "technician"].includes(req.user?.role)) {
+    return res.status(403).json({ message: "Notifications are available to customers and technicians." });
+  }
+  return next();
+};
+
+app.get(
+  "/api/notifications/my",
+  verifyToken,
+  verifyNotificationRole,
+  route(async (req, res) => {
+    const records = await notifications
+      .find({ recipientEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .limit(40)
+      .toArray();
+    const unreadCount = await notifications.countDocuments({
+      recipientEmail: req.user.email,
+      readAt: null,
+    });
+    return res.json({ notifications: records.map(serializeNotification), unreadCount });
+  })
+);
+
+app.patch(
+  "/api/notifications/:id/read",
+  verifyToken,
+  verifyNotificationRole,
+  route(async (req, res) => {
+    const id = toObjectId(req.params.id);
+    if (!id) return res.status(400).json({ message: "A valid notification ID is required." });
+    const result = await notifications.updateOne(
+      { _id: id, recipientEmail: req.user.email, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+    if (!result.matchedCount) {
+      const notification = await notifications.findOne({
+        _id: id,
+        recipientEmail: req.user.email,
+      });
+      if (!notification) return res.status(404).json({ message: "Notification not found." });
+    }
+    return res.json({ updated: true });
+  })
+);
+
+app.patch(
+  "/api/notifications/read-all",
+  verifyToken,
+  verifyNotificationRole,
+  route(async (req, res) => {
+    await notifications.updateMany(
+      { recipientEmail: req.user.email, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+    return res.json({ updated: true });
+  })
+);
 
 //Services: public 
 
@@ -637,6 +749,26 @@ app.post(
 
     try {
       const result = await bookings.insertOne(booking);
+      await Promise.all([
+        createNotification({
+          eventKey: `booking:${result.insertedId}:requested:technician`,
+          recipientEmail: booking.technicianEmail,
+          recipientRole: "technician",
+          type: "booking",
+          title: "New service request",
+          message: `${booking.customerName} requested ${booking.serviceTitle}.`,
+          href: "/dashboard/technician/requests",
+        }),
+        createNotification({
+          eventKey: `booking:${result.insertedId}:requested:customer`,
+          recipientEmail: booking.customerEmail,
+          recipientRole: "customer",
+          type: "booking",
+          title: "Request sent",
+          message: `Your request for ${booking.serviceTitle} was sent to ${booking.technicianName}.`,
+          href: "/dashboard/customer/bookings",
+        }),
+      ]);
       return res
         .status(201)
         .json(serializeBooking({ ...booking, _id: result.insertedId }));
@@ -681,7 +813,19 @@ app.patch(
         $unset: { activeKey: "" },
       }
     );
-    if (result.matchedCount) return res.json({ updated: true, status: "cancelled" });
+    if (result.matchedCount) {
+      const booking = await bookings.findOne({ _id: id });
+      await createNotification({
+        eventKey: `booking:${id}:cancelled:technician`,
+        recipientEmail: booking.technicianEmail,
+        recipientRole: "technician",
+        type: "booking",
+        title: "Request cancelled",
+        message: `${booking.customerName} cancelled the request for ${booking.serviceTitle}.`,
+        href: "/dashboard/technician/requests",
+      });
+      return res.json({ updated: true, status: "cancelled" });
+    }
 
     const booking = await bookings.findOne({ _id: id });
     if (!booking) return res.status(404).json({ message: "Booking not found." });
@@ -815,6 +959,22 @@ app.patch(
         .status(409)
         .json({ message: "This job was just updated. Refresh and try again." });
     }
+
+    const statusMessages = {
+      accepted: `Your request for ${booking.serviceTitle} was accepted by ${booking.technicianName}.`,
+      rejected: `Your request for ${booking.serviceTitle} was declined by ${booking.technicianName}.`,
+      "in-progress": `${booking.technicianName} has started work on ${booking.serviceTitle}.`,
+      completed: `${booking.technicianName} marked ${booking.serviceTitle} as complete. You can now pay for the service.`,
+    };
+    await createNotification({
+      eventKey: `booking:${id}:${nextStatus}:customer`,
+      recipientEmail: booking.customerEmail,
+      recipientRole: "customer",
+      type: "booking",
+      title: `Service request ${nextStatus === "in-progress" ? "in progress" : nextStatus}`,
+      message: statusMessages[nextStatus],
+      href: "/dashboard/customer/bookings",
+    });
 
     return res.json(serializeBooking(await bookings.findOne({ _id: id })));
   })
@@ -1022,11 +1182,27 @@ app.patch(
       return res.status(400).json({ message: "Status must be approved or rejected." });
     }
 
+    const service = await services.findOne({ _id: id });
+    if (!service) return res.status(404).json({ message: "Service not found." });
+
+    const reviewedAt = new Date();
     const result = await services.updateOne(
       { _id: id },
-      { $set: { approvalStatus, reviewedAt: new Date() } }
+      { $set: { approvalStatus, reviewedAt } }
     );
     if (!result.matchedCount) return res.status(404).json({ message: "Service not found." });
+    await createNotification({
+      eventKey: `service:${id}:${approvalStatus}:${reviewedAt.getTime()}`,
+      recipientEmail: service.technicianEmail,
+      recipientRole: "technician",
+      type: "service",
+      title: approvalStatus === "approved" ? "Service approved" : "Service not approved",
+      message:
+        approvalStatus === "approved"
+          ? `Your service "${service.title}" is approved and visible to customers.`
+          : `Your service "${service.title}" was not approved. Review it and contact support if needed.`,
+      href: "/dashboard/technician/my-services",
+    });
     return res.json({ updated: true, approvalStatus });
   })
 );
